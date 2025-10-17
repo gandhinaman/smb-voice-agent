@@ -1,85 +1,46 @@
-// server.js — final Render-hosted bridge for Twilio <-> OpenAI
-import http from "node:http";
-import { WebSocketServer, WebSocket } from "ws";
-import { parse as parseUrl } from "node:url";
+// server.js (ESM)
 
+import http from "http";
+import { WebSocketServer } from "ws";
+
+// --- env ---
 const PORT = process.env.PORT || 10000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// ---- US timezone map (for spoken confirmations only) ----
-const US_TZ = {
-  PT: { code: "PT", name: "Pacific Time", offset: -480 },
-  MT: { code: "MT", name: "Mountain Time", offset: -420 },
-  CT: { code: "CT", name: "Central Time", offset: -360 },
-  ET: { code: "ET", name: "Eastern Time", offset: -300 },
-};
-const DEFAULT_TZ = US_TZ[(process.env.TZ_REGION || "CT").toUpperCase()] || US_TZ.CT;
+// Optional: if set, we can hang up the PSTN call when AI is done
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 
-// ---- time helpers ----
-const addMin = (d, m) => new Date(d.getTime() + m * 60000);
-const withOffset = (d, off) => addMin(d, off);
-const spoken = (d, tz = DEFAULT_TZ) => {
-  const local = withOffset(d, tz.offset);
-  const day = local.toLocaleDateString("en-US", { weekday: "long" });
-  const month = local.toLocaleDateString("en-US", { month: "long" });
-  const date = local.getDate();
-  const time = local.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
-  return `${day}, ${month} ${date} at ${time} ${tz.code}`;
-};
-const nextAt = (dow, h, m, tz = DEFAULT_TZ, now = new Date()) => {
-  const local = withOffset(now, tz.offset);
-  const diff = (dow - local.getDay() + 7) % 7;
-  const target = new Date(local);
-  target.setDate(local.getDate() + diff);
-  target.setHours(h, m, 0, 0);
-  if (target <= local) target.setDate(target.getDate() + 7);
-  return addMin(target, -tz.offset);
-};
-const nextTwo = (tz = DEFAULT_TZ) => {
-  const slots = [
-    { d: 2, h: 14, m: 0 },
-    { d: 3, h: 10, m: 0 },
-    { d: 4, h: 14, m: 0 },
-    { d: 5, h: 11, m: 0 },
-  ].map((s) => nextAt(s.d, s.h, s.m, tz)).sort((a, b) => a - b);
-  return [slots[0], slots[1]];
-};
-
-// ---- Supabase helpers ----
-async function fetchBooking(id) {
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) return null;
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/call_bookings?id=eq.${encodeURIComponent(id)}&select=*`, {
-    headers: { apikey: SUPABASE_SERVICE_ROLE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` },
-  });
-  if (!res.ok) return null;
-  const arr = await res.json();
-  return arr?.[0] || null;
-}
-
-// ---- audio helpers ----
-const b2u = (b) => Uint8Array.from(Buffer.from(b, "base64"));
-const u2b = (u) => Buffer.from(u).toString("base64");
-const concatU8 = (a, b) => {
+// ---------- helpers (binary/audio) ----------
+function concatUint8(a, b) {
   const out = new Uint8Array(a.length + b.length);
   out.set(a, 0);
   out.set(b, a.length);
   return out;
-};
-function mulawToPCM16(m) {
-  const f = (x) => {
+}
+function base64ToUint8Array(base64) {
+  const bin = Buffer.from(base64, "base64");
+  return new Uint8Array(bin.buffer, bin.byteOffset, bin.byteLength);
+}
+function uint8ArrayToBase64(bytes) {
+  return Buffer.from(bytes).toString("base64");
+}
+
+// μ-law 8 kHz -> PCM16 24 kHz
+function convertMulawToPCM16(mulawData) {
+  const mulawToPcm = (x) => {
     x = ~x;
-    const s = x & 0x80;
-    const e = (x >> 4) & 7;
-    const n = x & 0x0F;
-    let y = (n << 3) + 0x84;
-    y <<= e;
-    y -= 0x84;
-    return s ? -y : y;
+    const sign = x & 0x80;
+    const exp = (x >> 4) & 7;
+    const man = x & 0x0F;
+    let s = (man << 3) + 0x84;
+    s <<= exp;
+    s -= 0x84;
+    return sign ? -s : s;
   };
-  const pcm8k = new Int16Array(m.length);
-  for (let i = 0; i < m.length; i++) pcm8k[i] = f(m[i]);
+  const pcm8k = new Int16Array(mulawData.length);
+  for (let i = 0; i < mulawData.length; i++) pcm8k[i] = mulawToPcm(mulawData[i]);
+  // naive 3x upsample to 24 kHz
   const pcm24k = new Int16Array(pcm8k.length * 3);
   for (let i = 0; i < pcm8k.length; i++) {
     const s = pcm8k[i];
@@ -89,192 +50,347 @@ function mulawToPCM16(m) {
   }
   return new Uint8Array(pcm24k.buffer);
 }
-function pcm16ToMulaw(p) {
-  const f = (pcm) => {
-    const s = pcm < 0 ? 0x80 : 0x00;
-    let x = Math.abs(pcm);
-    x = Math.min(x, 32635);
-    x += 0x84;
-    let e = 7;
-    for (let i = 0; i < 8; i++) {
-      if (x <= 0xff << i) {
-        e = i;
-        break;
-      }
+
+// PCM16 24 kHz -> μ-law 8 kHz
+function convertPCM16ToMulaw(pcm24kData) {
+  const pcmToMulaw = (pcm) => {
+    const sign = pcm < 0 ? 0x80 : 0x00;
+    let s = Math.abs(pcm);
+    s = Math.min(s, 32635);
+    s += 0x84;
+    let exp = 7;
+    for (let e = 0; e < 8; e++) {
+      if (s <= (0xff << e)) { exp = e; break; }
     }
-    const n = (x >> (e + 3)) & 0x0f;
-    return ~(s | (e << 4) | n);
+    const man = (s >> (exp + 3)) & 0x0F;
+    return ~(sign | (exp << 4) | man);
   };
-  const pcm = new Int16Array(p.buffer);
-  const pcm8k = new Int16Array(Math.floor(pcm.length / 3));
-  for (let i = 0; i < pcm8k.length; i++) pcm8k[i] = pcm[i * 3];
-  const mu = new Uint8Array(pcm8k.length);
-  for (let i = 0; i < pcm8k.length; i++) mu[i] = f(pcm8k[i]);
-  return mu;
+  const pcm24 = new Int16Array(pcm24kData.buffer, pcm24kData.byteOffset, Math.floor(pcm24kData.byteLength / 2));
+  const pcm8 = new Int16Array(Math.floor(pcm24.length / 3));
+  for (let i = 0; i < pcm8.length; i++) pcm8[i] = pcm24[i * 3];
+  const mulaw = new Uint8Array(pcm8.length);
+  for (let i = 0; i < pcm8.length; i++) mulaw[i] = pcmToMulaw(pcm8[i]);
+  return mulaw;
 }
 
-// ---- HTTP + WS server ----
+// Optional: hang up the PSTN call via Twilio REST
+async function hangupCallIfPossible(callSid) {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) return;
+  try {
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
+    const body = new URLSearchParams({ Status: "completed" });
+    const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${auth}`,
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body
+    });
+    console.log("☎️ Twilio hangup status:", res.status);
+  } catch (e) {
+    console.error("☎️ Twilio hangup failed:", e);
+  }
+}
+
+// ---------- HTTP server ----------
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", timestamp: new Date().toISOString() }));
-    return;
+    return res.end(JSON.stringify({ status: "ok", timestamp: new Date().toISOString() }));
   }
   res.writeHead(404);
   res.end("Not found");
 });
 
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+
 server.on("upgrade", (req, socket, head) => {
-  const { pathname } = parseUrl(req.url);
-  if (pathname === "/media" || pathname === "/media/") {
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  } else {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (url.pathname !== "/media") {
     socket.destroy();
+    return;
   }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
 });
 
+// ---------- per-connection state ----------
 wss.on("connection", async (twilioWs, req) => {
-  let openaiWs = null,
-    streamSid = null,
-    bookingId = null,
-    firstName = "there",
-    outMu = new Uint8Array(0);
-  const CHUNK = 160;
-  let flusher = null;
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  let firstName =
+    url.searchParams.get("firstName") ||
+    "there";
+  let bookingId = url.searchParams.get("bookingId") || null;
 
-  const stopAll = () => {
-    if (flusher) clearInterval(flusher);
-    try {
-      if (openaiWs?.readyState === 1) openaiWs.close();
-    } catch {}
-    try {
-      if (twilioWs?.readyState === 1) twilioWs.close();
-    } catch {}
-  };
+  let openaiWs = null;
+  let streamSid = null;
+  let callSid = null;
 
-  const startFlusher = () => {
-    if (flusher) return;
-    flusher = setInterval(() => {
-      if (!streamSid || twilioWs.readyState !== 1) return;
-      if (outMu.length >= CHUNK) {
-        const slice = outMu.subarray(0, CHUNK);
-        outMu = outMu.subarray(CHUNK);
-        twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: u2b(slice) } }));
+  let outMuLawBuffer = new Uint8Array(0);
+  let flushTimer = null;
+  let keepaliveTimer = null;
+  let healthTimer = null;
+  let idleTimer = null;
+  let lastActivity = Date.now();
+
+  const CHUNK = 160; // 20 ms @ 8 kHz μ-law
+
+  function startFlusher() {
+    if (flushTimer) return;
+    flushTimer = setInterval(() => {
+      try {
+        if (!streamSid || twilioWs.readyState !== twilioWs.OPEN) return;
+        if (outMuLawBuffer.length >= CHUNK) {
+          const slice = outMuLawBuffer.subarray(0, CHUNK);
+          outMuLawBuffer = outMuLawBuffer.subarray(CHUNK);
+          const payload = uint8ArrayToBase64(slice);
+          twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload } }));
+        } else {
+          // cheap keepalive mark when we have no audio to send
+          twilioWs.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tick" } }));
+        }
+      } catch (e) {
+        console.error("flusher error:", e);
       }
     }, 20);
-  };
+  }
 
+  function stopTimers() {
+    if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
+    if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
+    if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
+    if (idleTimer) { clearInterval(idleTimer); idleTimer = null; }
+  }
+
+  function safeCloseTwilio(code = 1000, reason = "normal") {
+    try {
+      if (twilioWs.readyState === twilioWs.OPEN) twilioWs.close(code, reason);
+    } catch {}
+  }
+  function safeCloseOpenAI(code = 1000, reason = "normal") {
+    try {
+      if (openaiWs && openaiWs.readyState === openaiWs.OPEN) openaiWs.close(code, reason);
+    } catch {}
+  }
+
+  // --- OpenAI Realtime connection ---
   async function connectOpenAI() {
-    const tokenRes = await fetch("https://api.openai.com/v1/realtime/sessions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "gpt-4o-realtime-preview-2024-12-17", voice: "ash" }),
-    });
-    if (!tokenRes.ok) {
-      console.error("OpenAI token error:", await tokenRes.text());
+    if (!OPENAI_API_KEY) {
+      console.error("Missing OPENAI_API_KEY");
       return;
     }
-    const eph = (await tokenRes.json()).client_secret.value;
-    openaiWs = new WebSocket(
-      "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
-      ["realtime", `openai-insecure-api-key.${eph}`, "openai-beta.realtime-v1"]
-    );
+    try {
+      // ephemeral token
+      const tokenRes = await fetch("https://api.openai.com/v1/realtime/sessions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-realtime-preview-2024-12-17",
+          voice: "ash"
+        })
+      });
+      if (!tokenRes.ok) {
+        console.error("OpenAI token error:", await tokenRes.text());
+        return;
+      }
+      const tokenData = await tokenRes.json();
+      const eph = tokenData?.client_secret?.value;
+      if (!eph) {
+        console.error("No ephemeral token returned");
+        return;
+      }
 
-    openaiWs.on("open", () => {
-      const [o1, o2] = nextTwo(DEFAULT_TZ);
-      const t1 = spoken(o1, DEFAULT_TZ);
-      const t2 = spoken(o2, DEFAULT_TZ);
-      const instructions = `
-Role: You are Alex, a Microsoft Security advisor speaking with ${firstName}.
-Tone: conversational, consultative, concise (1-2 sentences).
+      openaiWs = new WebSocket(
+        "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
+        ["realtime", `openai-insecure-api-key.${eph}`, "openai-beta.realtime-v1"]
+      );
 
-Goal: Explore ${firstName}'s business security posture, share short credible facts when relevant, and guide toward a follow-up specialist call.
-
-Approach:
-1. Start with an open question about their confidence in handling cyber threats.
-2. Listen, then adapt:
-   • If unaware → share one fact then ask a question.
-   • If thinking about ROI → note that preventing one breach (~$200K loss) often pays for improvements.
-   • If engaged → dig slightly deeper, then suggest a 15-min specialist call.
-   • If busy → skip facts, propose quick follow-up times.
-3. Use 1 fact at a time, from these examples:
-   • 47% of small businesses have faced an attack.
-   • Phishing and ransomware are top threats.
-   • MFA and Zero Trust identity block most phishing.
-   • 785,000+ businesses trust Microsoft Security.
-4. When ready, offer times naturally:
-   "Would ${t1} or ${t2} work for you?" then stop.
-
-Rules:
-- One fact per few turns max.
-- Never stack or sound like a pitch.
-- Confirm time with weekday, date, and timezone code.
-- If they decline, thank and end politely.`;
-
-      openaiWs.send(
-        JSON.stringify({
+      openaiWs.onopen = () => {
+        lastActivity = Date.now();
+        // Configure consultative session
+        openaiWs.send(JSON.stringify({
           type: "session.update",
           session: {
             modalities: ["text", "audio"],
-            instructions,
+            instructions: `
+You are Alex, a Digital Sales Specialist with Microsoft. You’re calling ${firstName} about practical ways to improve small-business security. Your goal is to determine if a short follow-up call with a Security Specialist would be useful — not to hard sell.
+
+Principles:
+- Keep turns short: one sentence or one question, then stop and wait.
+- Use ${firstName}'s name occasionally, every 2 to 3 exchanges.
+- Never ask what tools they currently use.
+- Acknowledge what they say and ask one clear next question.
+- Be consultative. Offer a quick fact only when it helps them decide.
+- If they’re thinking it through, compare simple ROI or risk in one line, then ask a question.
+- If they’re not ready, propose a brief specialist call and give two concrete time options. After they pick one, confirm day, calendar date, and local time in words, then stop.
+
+Helpful fact nuggets (use sparingly, max one at a time, only when relevant):
+- Many attacks target small and mid-size businesses.
+- A single breach can cost hundreds of thousands of dollars including downtime and recovery.
+- Microsoft Security is trusted by a large number of businesses.
+
+Politeness and exit:
+- If they decline clearly, thank them and wrap up.
+- Do not monologue. Keep it conversational and brief.
+            `.trim(),
             voice: "ash",
             input_audio_format: "pcm16",
             output_audio_format: "pcm16",
             input_audio_transcription: { model: "whisper-1" },
-            turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 900 },
-            temperature: 0.6,
-          },
-        })
-      );
+            turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 1000 },
+            temperature: 0.7
+          }
+        }));
 
-      setTimeout(() => {
-        openaiWs.send(
-          JSON.stringify({
+        // Short opening, then stop
+        setTimeout(() => {
+          if (openaiWs?.readyState !== openaiWs.OPEN) return;
+          openaiWs.send(JSON.stringify({
             type: "response.create",
             response: {
               modalities: ["text", "audio"],
-              instructions: `Hi ${firstName}, this is Alex with Microsoft Security. How are you feeling about your company's protection against threats lately?`,
-            },
-          })
-        );
-      }, 200);
-    });
+              instructions: `Say only: "Hi ${firstName}, this is Alex with Microsoft Security. Do you have a quick minute for one question?" Then stop and wait.`
+            }
+          }));
+        }, 300);
+      };
 
-    openaiWs.on("message", (b) => {
-      const d = JSON.parse(b);
-      if (d.type === "response.audio.delta" && d.delta) {
-        const mu = pcm16ToMulaw(b2u(d.delta));
-        outMu = concatU8(outMu, mu);
-      }
-    });
+      // OpenAI → Twilio audio bridge and transcript capture
+      openaiWs.onmessage = (evt) => {
+        try {
+          lastActivity = Date.now();
+          const data = JSON.parse(evt.data);
+          if (data.type === "response.audio.delta" && data.delta) {
+            const mulaw = convertPCM16ToMulaw(base64ToUint8Array(data.delta));
+            outMuLawBuffer = concatUint8(outMuLawBuffer, mulaw);
+          }
+        } catch (e) {
+          console.error("OpenAI message error:", e);
+        }
+      };
 
-    openaiWs.on("close", () => stopAll());
+      openaiWs.onclose = async (evt) => {
+        console.log("🔌 OpenAI closed", evt.code, evt.reason, evt.wasClean);
+        // close Twilio stream and optionally hang up the call
+        safeCloseTwilio(1000, "openai-closed");
+        await hangupCallIfPossible(callSid);
+      };
+
+      openaiWs.onerror = (e) => {
+        console.error("OpenAI WS error:", e?.message || e);
+      };
+    } catch (e) {
+      console.error("connectOpenAI error:", e);
+    }
   }
 
-  twilioWs.on("message", async (b) => {
-    const m = JSON.parse(b);
-    if (m.event === "start") {
-      streamSid = m.start.streamSid;
-      bookingId = m.start.customParameters?.bookingId;
-      firstName = m.start.customParameters?.firstName || firstName;
-      if (!firstName && bookingId) {
-        const booking = await fetchBooking(bookingId);
-        if (booking?.customer_name) firstName = booking.customer_name.split(" ")[0];
+  // --- Twilio stream handlers ---
+  twilioWs.on("open", () => {
+    console.log("✅ Twilio WS connected");
+  });
+
+  twilioWs.on("message", async (raw) => {
+    try {
+      lastActivity = Date.now();
+      const msg = JSON.parse(raw.toString());
+
+      switch (msg.event) {
+        case "start": {
+          streamSid = msg.start.streamSid;
+          callSid = msg.start.callSid;
+
+          // allow <Parameter name="firstName"> or query ?firstName=
+          const startUrl = msg.start.streamUrl ? new URL(msg.start.streamUrl) : null;
+          const fromParam =
+            (msg.start.customParameters && msg.start.customParameters.firstName) ||
+            (startUrl && startUrl.searchParams.get("firstName"));
+          if (fromParam && (!firstName || firstName === "there")) firstName = fromParam;
+
+          console.log("📞 start: streamSid", streamSid, "callSid", callSid, "firstName", firstName, "bookingId", bookingId);
+          startFlusher();
+
+          // keepalives and health logs
+          keepaliveTimer = setInterval(() => {
+            if (twilioWs.readyState === twilioWs.OPEN && streamSid) {
+              try {
+                twilioWs.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "keepalive" } }));
+              } catch {}
+            }
+          }, 3000);
+
+          healthTimer = setInterval(() => {
+            const idle = Date.now() - lastActivity;
+            console.log("🏥 health", { twilio: twilioWs.readyState, openai: openaiWs?.readyState, idleMs: idle, outBuf: outMuLawBuffer.length });
+          }, 5000);
+
+          // idle shutdown if nothing happens for 45s
+          idleTimer = setInterval(async () => {
+            const idle = Date.now() - lastActivity;
+            if (idle > 45000) {
+              console.log("⏱️ Ending inactive call session");
+              stopTimers();
+              safeCloseOpenAI(1000, "idle-timeout");
+              safeCloseTwilio(1000, "idle-timeout");
+              await hangupCallIfPossible(callSid);
+            }
+          }, 5000);
+
+          await connectOpenAI();
+          break;
+        }
+
+        case "media": {
+          if (openaiWs?.readyState === openaiWs.OPEN) {
+            try {
+              const pcm24 = convertMulawToPCM16(base64ToUint8Array(msg.media.payload));
+              const b64 = uint8ArrayToBase64(pcm24);
+              openaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
+            } catch (e) {
+              console.error("to OpenAI audio error:", e);
+            }
+          }
+          break;
+        }
+
+        case "mark":
+          // ignore
+          break;
+
+        case "stop": {
+          console.log("🛑 Twilio stop event, closing both sockets");
+          stopTimers();
+          safeCloseOpenAI(1000, "twilio-stop");
+          safeCloseTwilio(1000, "twilio-stop");
+          await hangupCallIfPossible(callSid);
+          break;
+        }
+
+        default:
+          console.log("⚠️ Unknown Twilio event:", msg.event);
       }
-      startFlusher();
-      await connectOpenAI();
-    } else if (m.event === "media") {
-      if (openaiWs?.readyState === 1) {
-        const pcm24 = mulawToPCM16(b2u(m.media.payload));
-        openaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: u2b(pcm24) }));
-      }
-    } else if (m.event === "stop") {
-      stopAll();
+    } catch (e) {
+      console.error("Twilio msg error:", e);
     }
   });
 
-  twilioWs.on("close", () => stopAll());
+  twilioWs.on("close", async () => {
+    console.log("🔌 Twilio WS closed");
+    stopTimers();
+    safeCloseOpenAI(1000, "twilio-closed");
+    await hangupCallIfPossible(callSid);
+  });
+
+  twilioWs.on("error", (e) => {
+    console.error("Twilio WS error:", e?.message || e);
+  });
 });
 
-server.listen(PORT, () => console.log("✅ Media bridge running on", PORT));
+server.listen(PORT, () => {
+  console.log(`Media bridge running on ${PORT}`);
+});
