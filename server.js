@@ -91,27 +91,31 @@ function pickFirstName(fullName) {
   return parts[0] || 'there';
 }
 
-// Simple time extractor: returns { hour24, minute, ampmSeen } or null
+// Robust time extractor without regex errors
+// Returns { hour24, minute, ampmSeen } or null
 function extractTime(text) {
-  // matches: "1 pm", "1pm", "1:30 pm", "13:00", "1p"
-  const re = /(\b(?:1[0-2]|0?[1-9))(?::([0-5]\d))?\s*(a\.?m\.?|p\.?m\.?|am|pm|a|p)?\b)|\b(1[0-9]|2[0-3]):([0-5]\d)\b/ig;
-  let m;
-  let last = null;
-  while ((m = re.exec(text)) !== null) {
-    if (m[1]) {
-      const hour = parseInt(m[1].replace(/\D/g, ''), 10);
-      const minute = m[2] ? parseInt(m[2], 10) : 0;
-      const ampm = m[3] ? m[3].toLowerCase().replace('.', '') : '';
-      let hour24 = hour;
-      if (ampm.startsWith('p') && hour !== 12) hour24 = hour + 12;
-      if (ampm.startsWith('a') && hour === 12) hour24 = 0;
-      last = { hour24, minute, ampmSeen: Boolean(ampm) };
-    } else if (m[4] && m[5]) {
-      // 24h like 13:00
-      last = { hour24: parseInt(m[4], 10), minute: parseInt(m[5], 10), ampmSeen: false };
-    }
+  const pattern = /\b((?:1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(?:a\.?m\.?|p\.?m\.?|am|pm|a|p)?|(?:1[0-9]|2[0-3]):([0-5]\d))\b/ig;
+  const matches = [...text.matchAll(pattern)];
+  if (!matches.length) return null;
+  const last = matches[matches.length - 1];
+  const full = last[1];
+
+  // If it matched 24h like 13:00, last[3] is minute part for 24h branch
+  if (last[3]) {
+    const [hh, mm] = full.split(':');
+    return { hour24: parseInt(hh, 10), minute: parseInt(mm, 10), ampmSeen: false };
   }
-  return last;
+
+  // Otherwise it matched 12h branch like "1", "1:30 pm", "1pm"
+  const twelve = /^(?:1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(a\.?m\.?|p\.?m\.?|am|pm|a|p)?$/i.exec(full);
+  if (!twelve) return null;
+  const hour = parseInt(full, 10); // safe because branch starts with hour
+  const min = twelve[1] ? parseInt(twelve[1], 10) : 0;
+  const ampmRaw = twelve[2] ? twelve[2].toLowerCase() : '';
+  let hour24 = hour;
+  if (ampmRaw.startsWith('p') && hour !== 12) hour24 = hour + 12;
+  if (ampmRaw.startsWith('a') && hour === 12) hour24 = 0;
+  return { hour24, minute: min, ampmSeen: Boolean(ampmRaw) };
 }
 
 function nextWeekdayFromNow(weekdayIndex) {
