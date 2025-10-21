@@ -1,11 +1,14 @@
 // server.js — Twilio <Stream> ↔ OpenAI Realtime bridge (Node 18+, "type":"module")
 
 import http from "node:http";
-import { parse as parseUrl } from "node:url";
 import WebSocket, { WebSocketServer } from "ws";
 
+// -------- env --------
 const PORT = Number(process.env.PORT || 10000);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
 const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 
 // ---------- small helpers ----------
@@ -73,11 +76,37 @@ function makeBeepMs(ms = 400) {
   for (let i = 0; i < n; i++) mu[i] = pcm16ToMulawByte(pcm[i]);
   return mu;
 }
-const BEEP = makeBeepMs(400);
+const BEEP = makeBeepMs(300);
+
+// -------- Supabase fetch for name fallback --------
+async function fetchFirstNameByBookingId(bookingId) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !bookingId) return null;
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/call_bookings?id=eq.${encodeURIComponent(bookingId)}&select=customer_name`;
+    const res = await fetch(url, {
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE_KEY,
+        Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
+      }
+    });
+    if (!res.ok) {
+      log("Supabase name fetch failed:", res.status, await res.text());
+      return null;
+    }
+    const rows = await res.json();
+    const full = rows?.[0]?.customer_name || "";
+    const f = (full.split(" ").filter(Boolean)[0]) || null;
+    return f;
+  } catch (e) {
+    log("Supabase name fetch error:", e);
+    return null;
+  }
+}
 
 // ---------- HTTP (health) ----------
 const httpServer = http.createServer((req, res) => {
-  if (req.url?.startsWith("/health")) {
+  const u = new URL(req.url, `http://${req.headers.host}`);
+  if (u.pathname === "/health") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ status: "ok", time: new Date().toISOString() }));
   } else {
@@ -88,49 +117,112 @@ const httpServer = http.createServer((req, res) => {
 // ---------- WS upgrade ----------
 const wss = new WebSocketServer({ noServer: true });
 httpServer.on("upgrade", (req, socket, head) => {
-  const { pathname, query } = parseUrl(req.url, true);
-  if (pathname === "/media") {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req, query);
-    });
-  } else socket.destroy();
+  try {
+    const u = new URL(req.url, `http://${req.headers.host}`);
+    if (u.pathname === "/media") {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit("connection", ws, req, u);
+      });
+    } else {
+      socket.destroy();
+    }
+  } catch {
+    socket.destroy();
+  }
 });
 
 // ---------- Bridge logic ----------
-wss.on("connection", (twilioWs, req, query) => {
-  const bookingId = query?.bookingId || null;
-  let firstName = query?.firstName || "there";
+wss.on("connection", (twilioWs, req, urlObj) => {
+  // Query parameters - Twilio may not include them, so we rely on customParameters in start
+  let bookingId = urlObj.searchParams.get("bookingId");
+  let firstName = urlObj.searchParams.get("firstName") || "there";
+  let streamSid = null;
+
   let openaiWs = null;
   let outMu = new Uint8Array(0);
   const CHUNK = 160;
 
   log("🔗 WS connected", { bookingId, firstName });
 
-  // ---- Twilio → OpenAI ----
+  // Pace audio to Twilio using the REAL streamSid
+  const flushTimer = setInterval(() => {
+    try {
+      if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
+      if (outMu.length >= CHUNK) {
+        const slice = outMu.subarray(0, CHUNK);
+        outMu = outMu.subarray(CHUNK);
+        twilioWs.send(JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload: u8ToB64(slice) }
+        }));
+      } else {
+        twilioWs.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tick" } }));
+      }
+    } catch (e) {
+      log("flush error:", e);
+    }
+  }, 20);
+
   twilioWs.on("message", async (evt) => {
     const msg = JSON.parse(evt.toString());
+
     if (msg.event === "start") {
-      log("▶ START", msg.start.customParameters);
+      streamSid = msg.start.streamSid;
+
+      // Prefer customParameters
       const cp = msg.start.customParameters || {};
-      if (cp.firstName && cp.firstName.trim()) firstName = cp.firstName;
-      outMu = concatU8(outMu, BEEP); // prove audio path
-      await connectOpenAI(firstName, twilioWs);
-    } else if (msg.event === "media" && openaiWs?.readyState === WebSocket.OPEN) {
-      const pcm24 = mulaw8kToPcm24k(b64ToU8(msg.media.payload));
-      openaiWs.send(JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: u8ToB64(pcm24)
-      }));
+      if (!bookingId && cp.bookingId) bookingId = cp.bookingId;
+      if ((!firstName || firstName === "there") && cp.firstName) firstName = cp.firstName;
+
+      // Fallback to Supabase lookup if still missing name
+      if ((!firstName || firstName === "there") && bookingId) {
+        const f = await fetchFirstNameByBookingId(bookingId);
+        if (f) firstName = f;
+      }
+
+      log("▶ START", { streamSid, bookingId, firstName });
+
+      // Prove audio path with a short beep
+      outMu = concatU8(outMu, BEEP);
+
+      // Connect OpenAI
+      await connectOpenAI(firstName, twilioWs, () => streamSid, (muChunk) => {
+        outMu = concatU8(outMu, muChunk);
+      });
+
+    } else if (msg.event === "media") {
+      // caller audio → OpenAI
+      if (openaiWs?.readyState === WebSocket.OPEN) {
+        const pcm24 = mulaw8kToPcm24k(b64ToU8(msg.media.payload));
+        openaiWs.send(JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: u8ToB64(pcm24)
+        }));
+      }
     } else if (msg.event === "stop") {
       log("🛑 STOP received");
-      openaiWs?.close(1000, "twilio-stop");
-      twilioWs?.close(1000, "twilio-stop");
+      try { openaiWs?.close(1000, "twilio-stop"); } catch {}
+      try { twilioWs?.close(1000, "twilio-stop"); } catch {}
+      clearInterval(flushTimer);
     }
   });
+
+  twilioWs.on("close", () => {
+    log("Twilio closed");
+    try { openaiWs?.close(1000, "twilio-closed"); } catch {}
+    clearInterval(flushTimer);
+  });
+
+  twilioWs.on("error", (e) => log("Twilio WS error:", e?.message || e));
+
+  // Keep a handle so connectOpenAI can set it
+  function setOpenAI(ws) { openaiWs = ws; }
+  twilioWs._setOpenAI = setOpenAI;
 });
 
 // ---------- Connect to OpenAI ----------
-async function connectOpenAI(firstName, twilioWs) {
+async function connectOpenAI(firstName, twilioWs, getStreamSid, pushMuLaw) {
   const tRes = await fetch("https://api.openai.com/v1/realtime/sessions", {
     method: "POST",
     headers: {
@@ -153,26 +245,12 @@ async function connectOpenAI(firstName, twilioWs) {
     "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
     ["realtime", `openai-insecure-api-key.${eph}`, "openai-beta.realtime-v1"]
   );
-
-  let outMu = new Uint8Array(0);
-  const CHUNK = 160;
-  const flushTimer = setInterval(() => {
-    if (twilioWs.readyState !== WebSocket.OPEN) return;
-    if (outMu.length >= CHUNK) {
-      const slice = outMu.subarray(0, CHUNK);
-      outMu = outMu.subarray(CHUNK);
-      twilioWs.send(JSON.stringify({
-        event: "media",
-        streamSid: "fake",
-        media: { payload: u8ToB64(slice) }
-      }));
-    }
-  }, 20);
+  twilioWs._setOpenAI?.(oai);
 
   oai.on("open", () => {
     log("OAI ▶ open");
 
-    // Consultative session setup
+    // Configure concise, consultative session
     oai.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -181,17 +259,21 @@ async function connectOpenAI(firstName, twilioWs) {
         input_audio_format: "pcm16",
         output_audio_format: "pcm16",
         input_audio_transcription: { model: "whisper-1" },
-        turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 1000 },
-        temperature: 0.8,
+        turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 900 },
+        temperature: 0.7,
         instructions: `
-You are Alex from Microsoft, having a consultative conversation about small-business security with ${firstName}.
-Goal: politely engage and see if a short specialist follow-up makes sense.
-Use ${firstName}'s name naturally, keep each turn short (1–2 sentences), and never stack multiple facts.
-Use quick, relevant nuggets only when helpful:
-- About 43% of cyberattacks target small and mid-sized businesses.
-- The average breach costs around $200,000, including downtime and recovery.
-- Many SMBs use Microsoft Security for identity, email, and device protection.
-Be conversational and human. If ${firstName} is busy, ask for a better time. If they’re engaged, offer 2–3 appointment slots (Tue 2, Wed 10, Thu 2). Confirm and stop.`
+You are Alex from Microsoft, having a brief, consultative chat about small-business security with ${firstName}.
+Goal: understand where they are and see if a short specialist follow-up makes sense. Keep each turn to 1–2 sentences.
+Use one nugget only when helpful, not all at once:
+- About 43% of cyberattacks target SMBs.
+- A breach can cost around $200,000 including downtime and recovery.
+- Many SMBs rely on Microsoft Security across identity, email, and devices.
+Tactics:
+- Start with a light opener and one question.
+- If they seem uncertain, briefly frame ROI or risk in plain language and ask a single follow-up.
+- If engaged, offer two or three specific time options for a specialist call (Tue 2, Wed 10, Thu 2). Then confirm and stop.
+- If busy, ask for a better time instead of pushing details.
+Avoid: long monologues, tool comparisons, or asking what vendor they use.`
       }
     }));
 
@@ -210,16 +292,21 @@ Be conversational and human. If ${firstName} is busy, ask for a better time. If 
     const data = JSON.parse(evt.toString());
     if (data.type === "response.audio.delta" && data.delta) {
       const mu = pcm24kToMulaw8k(b64ToU8(data.delta));
-      outMu = concatU8(outMu, mu);
+      pushMuLaw(mu);
+    } else if (data.type === "error") {
+      log("OAI ▶ error", JSON.stringify(data, null, 2));
     } else if (data.type !== "response.audio.delta") {
       log("OAI ▶", data.type);
     }
   });
 
   oai.on("close", (e) => {
-    clearInterval(flushTimer);
     log("OAI ▶ closed", e.code, e.reason || "");
-    try { twilioWs.close(1000, "oai-closed"); } catch {}
+    // Close Twilio if OpenAI ends first
+    const sid = getStreamSid();
+    if (sid && twilioWs.readyState === WebSocket.OPEN) {
+      try { twilioWs.close(1000, "oai-closed"); } catch {}
+    }
   });
 
   oai.on("error", (e) => log("OAI ▶ error", e?.message || e));
