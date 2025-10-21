@@ -65,19 +65,6 @@ function pcm24kToMulaw8k(u8pcm24) {
   return out;
 }
 
-// ---------- Beep generator ----------
-function makeBeepMs(ms = 400) {
-  const sr = 8000;
-  const n = Math.floor((ms / 1000) * sr);
-  const pcm = new Int16Array(n);
-  const f = 1000;
-  for (let i = 0; i < n; i++) pcm[i] = Math.floor(Math.sin((2 * Math.PI * f * i) / sr) * 12000);
-  const mu = new Uint8Array(n);
-  for (let i = 0; i < n; i++) mu[i] = pcm16ToMulawByte(pcm[i]);
-  return mu;
-}
-const BEEP = makeBeepMs(300);
-
 // -------- Supabase fetch for name fallback --------
 async function fetchFirstNameByBookingId(bookingId) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !bookingId) return null;
@@ -133,7 +120,6 @@ httpServer.on("upgrade", (req, socket, head) => {
 
 // ---------- Bridge logic ----------
 wss.on("connection", (twilioWs, req, urlObj) => {
-  // Query parameters - Twilio may not include them, so we rely on customParameters in start
   let bookingId = urlObj.searchParams.get("bookingId");
   let firstName = urlObj.searchParams.get("firstName") || "there";
   let streamSid = null;
@@ -144,7 +130,6 @@ wss.on("connection", (twilioWs, req, urlObj) => {
 
   log("🔗 WS connected", { bookingId, firstName });
 
-  // Pace audio to Twilio using the REAL streamSid
   const flushTimer = setInterval(() => {
     try {
       if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
@@ -183,16 +168,12 @@ wss.on("connection", (twilioWs, req, urlObj) => {
 
       log("▶ START", { streamSid, bookingId, firstName });
 
-      // Prove audio path with a short beep
-      outMu = concatU8(outMu, BEEP);
-
       // Connect OpenAI
       await connectOpenAI(firstName, twilioWs, () => streamSid, (muChunk) => {
         outMu = concatU8(outMu, muChunk);
       });
 
     } else if (msg.event === "media") {
-      // caller audio → OpenAI
       if (openaiWs?.readyState === WebSocket.OPEN) {
         const pcm24 = mulaw8kToPcm24k(b64ToU8(msg.media.payload));
         openaiWs.send(JSON.stringify({
@@ -216,7 +197,6 @@ wss.on("connection", (twilioWs, req, urlObj) => {
 
   twilioWs.on("error", (e) => log("Twilio WS error:", e?.message || e));
 
-  // Keep a handle so connectOpenAI can set it
   function setOpenAI(ws) { openaiWs = ws; }
   twilioWs._setOpenAI = setOpenAI;
 });
@@ -250,7 +230,7 @@ async function connectOpenAI(firstName, twilioWs, getStreamSid, pushMuLaw) {
   oai.on("open", () => {
     log("OAI ▶ open");
 
-    // Configure concise, consultative session
+    // Configure concise, consultative session with voice here
     oai.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -277,12 +257,11 @@ Avoid: long monologues, tool comparisons, or asking what vendor they use.`
       }
     }));
 
-    // Initial greeting
+    // Initial greeting — no per-response audio object
     oai.send(JSON.stringify({
       type: "response.create",
       response: {
         modalities: ["audio"],
-        audio: { voice: "ash" },
         instructions: `Hi ${firstName}, this is Alex from Microsoft. Do you have a quick minute to talk about keeping your business secure?`
       }
     }));
@@ -302,7 +281,6 @@ Avoid: long monologues, tool comparisons, or asking what vendor they use.`
 
   oai.on("close", (e) => {
     log("OAI ▶ closed", e.code, e.reason || "");
-    // Close Twilio if OpenAI ends first
     const sid = getStreamSid();
     if (sid && twilioWs.readyState === WebSocket.OPEN) {
       try { twilioWs.close(1000, "oai-closed"); } catch {}
