@@ -1,4 +1,5 @@
-// server.js — Twilio <Stream> ↔ OpenAI Realtime bridge (Node 18+, "type":"module")
+// server.js — Twilio <Stream> ↔ OpenAI Realtime bridge
+// Node >=18, package.json must have: { "type": "module", "start": "node server.js" }
 
 import http from "node:http";
 import WebSocket, { WebSocketServer } from "ws";
@@ -13,7 +14,7 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 
 const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 
-// ---------- small helpers ----------
+// ---------- helpers ----------
 const b64ToU8 = (b64) => new Uint8Array(Buffer.from(b64, "base64"));
 const u8ToB64 = (u8) => Buffer.from(u8).toString("base64");
 const concatU8 = (a, b) => {
@@ -67,7 +68,7 @@ function pcm24kToMulaw8k(u8pcm24) {
   return out;
 }
 
-// -------- Supabase fetch for name fallback --------
+// ---------- Supabase name fallback ----------
 async function fetchFirstNameByBookingId(bookingId) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !bookingId) return null;
   try {
@@ -114,7 +115,7 @@ async function hangupTwilioCall(callSid) {
   }
 }
 
-// ---------- HTTP (health) ----------
+// ---------- HTTP (health only) ----------
 const httpServer = http.createServer((req, res) => {
   const u = new URL(req.url, `http://${req.headers.host}`);
   if (u.pathname === "/health") {
@@ -142,33 +143,28 @@ httpServer.on("upgrade", (req, socket, head) => {
   }
 });
 
-// ---------- Bridge logic ----------
+// ---------- Bridge ----------
 wss.on("connection", (twilioWs, req, urlObj) => {
   let bookingId = urlObj.searchParams.get("bookingId");
-  let firstName = urlObj.searchParams.get("firstName") || "there";
+  let firstName = urlObj.searchParams.get("firstName") || "there"; // will be overwritten at "start"
   let streamSid = null;
   let callSid = null;
 
   let openaiWs = null;
   let outMu = new Uint8Array(0);
   const CHUNK = 160;
-
-  // goodbye detection
   let shouldHangUp = false;
 
   log("🔗 WS connected", { bookingId, firstName });
 
+  // 20ms pacing to Twilio
   const flushTimer = setInterval(() => {
     try {
       if (!streamSid || twilioWs.readyState !== WebSocket.OPEN) return;
       if (outMu.length >= CHUNK) {
         const slice = outMu.subarray(0, CHUNK);
         outMu = outMu.subarray(CHUNK);
-        twilioWs.send(JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: u8ToB64(slice) }
-        }));
+        twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: u8ToB64(slice) } }));
       } else {
         twilioWs.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tick" } }));
       }
@@ -186,8 +182,10 @@ wss.on("connection", (twilioWs, req, urlObj) => {
 
       const cp = msg.start.customParameters || {};
       if (!bookingId && cp.bookingId) bookingId = cp.bookingId;
-      if ((!firstName || firstName === "there") && cp.firstName) firstName = cp.firstName;
+      // prefer cp.firstName if provided
+      if (cp.firstName) firstName = cp.firstName;
 
+      // otherwise fetch from Supabase
       if ((!firstName || firstName === "there") && bookingId) {
         const f = await fetchFirstNameByBookingId(bookingId);
         if (f) firstName = f;
@@ -214,17 +212,14 @@ wss.on("connection", (twilioWs, req, urlObj) => {
     } else if (msg.event === "media") {
       if (openaiWs?.readyState === WebSocket.OPEN) {
         const pcm24 = mulaw8kToPcm24k(b64ToU8(msg.media.payload));
-        openaiWs.send(JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: u8ToB64(pcm24)
-        }));
+        openaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: u8ToB64(pcm24) }));
       }
+
     } else if (msg.event === "stop") {
       log("🛑 STOP received");
       try { openaiWs?.close(1000, "twilio-stop"); } catch {}
       try { twilioWs?.close(1000, "twilio-stop"); } catch {}
       clearInterval(flushTimer);
-      // If caller hung up first, ensure call is ended on Twilio too
       if (!shouldHangUp) await hangupTwilioCall(callSid);
     }
   });
@@ -239,23 +234,14 @@ wss.on("connection", (twilioWs, req, urlObj) => {
   twilioWs.on("error", (e) => log("Twilio WS error:", e?.message || e));
 });
 
-// ---------- Connect to OpenAI with instant greeting, then enable VAD ----------
+// ---------- OpenAI connect (immediate greet; fix modalities; VAD after 600ms) ----------
 async function connectOpenAI({ firstName, twilioWs, getStreamSid, pushMuLaw, onGoodbye, setOpenAI }) {
   const tRes = await fetch("https://api.openai.com/v1/realtime/sessions", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-realtime-preview-2024-12-17",
-      voice: "ash"
-    })
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o-realtime-preview-2024-12-17", voice: "ash" })
   });
-  if (!tRes.ok) {
-    log("❌ token error:", await tRes.text());
-    return;
-  }
+  if (!tRes.ok) { log("❌ token error:", await tRes.text()); return; }
   const eph = (await tRes.json())?.client_secret?.value;
   if (!eph) return log("❌ no ephemeral token");
 
@@ -268,7 +254,7 @@ async function connectOpenAI({ firstName, twilioWs, getStreamSid, pushMuLaw, onG
   oai.on("open", () => {
     log("OAI ▶ open");
 
-    // 1) session.update without VAD so the greeting speaks immediately
+    // Session config (no VAD yet so greeting plays immediately)
     oai.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -278,33 +264,32 @@ async function connectOpenAI({ firstName, twilioWs, getStreamSid, pushMuLaw, onG
         output_audio_format: "pcm16",
         input_audio_transcription: { model: "whisper-1" },
         temperature: 0.7,
-        // omit turn_detection here to avoid waiting
         instructions: `
 You are Alex from Microsoft's SMB Security Digital Sales team.
-Be brief and consultative. One or two sentences per turn.
+Style: brief, human, consultative (1 sentence or a short question per turn).
 Use light fact nuggets only when helpful, not all at once:
 - About 43% of cyberattacks target small businesses.
 - A breach can cost around $200,000 including downtime and recovery.
 - Many SMBs rely on Microsoft Security across identity, email, and devices.
 Tactics:
-- Start with a clear intro and purpose, then ask one question.
-- If they are unsure, briefly frame ROI or risk in plain language and ask a simple follow-up.
-- If engaged, offer specific time options for a short specialist call (Tue 2, Wed 10, Thu 2). Then confirm and stop.
-- If busy, ask for a better time rather than pushing details.
-Avoid long monologues or asking which vendor they use.`
+- Clear intro & purpose, then a simple question (no monologues).
+- If unsure/hesitant: frame ROI/risk in plain words, ask one follow-up.
+- If engaged: offer specific time options for a short specialist call (Tue 2, Wed 10, Thu 2).
+- If busy: ask for a better time.
+- Avoid asking which vendor they use.`
       }
     }));
 
-    // Speak immediately
+    // IMPORTANT: response.modalities must include both "audio" and "text"
     oai.send(JSON.stringify({
       type: "response.create",
       response: {
-        modalities: ["audio"],
-        instructions: `Hi ${firstName}, this is Alex from Microsoft's SMB Security Digital Sales team. Do you have a quick minute to discuss keeping your business secure and whether a short specialist follow-up would help?`
+        modalities: ["audio", "text"],
+        instructions: `Hi ${firstName}, this is Alex from Microsoft's SMB Security Digital Sales team. Do you have a quick minute to talk about keeping your business secure and whether a short specialist follow-up might help?`
       }
     }));
 
-    // 2) after greeting, enable server VAD for normal back-and-forth
+    // enable VAD after the greeting starts
     setTimeout(() => {
       oai.send(JSON.stringify({
         type: "session.update",
@@ -322,7 +307,6 @@ Avoid long monologues or asking which vendor they use.`
       const mu = pcm24kToMulaw8k(b64ToU8(data.delta));
       pushMuLaw(mu);
     } else if (data.type === "response.audio_transcript.done") {
-      // detect polite wrap-up to end the call gracefully
       const t = (data.transcript || "").toLowerCase();
       if (/(goodbye|talk soon|i’ll let you go|i will let you go|thanks for your time|have a great day|we’ll speak soon|we will speak soon)/i.test(t)) {
         onGoodbye?.();
@@ -335,7 +319,7 @@ Avoid long monologues or asking which vendor they use.`
   });
 
   oai.on("close", async (e) => {
-    log("OAI ▶ closed", e.code, e.reason || "");
+    log("OAI ▶ closed", e?.code, e?.reason || "");
     const sid = getStreamSid();
     if (sid && twilioWs.readyState === WebSocket.OPEN) {
       try { twilioWs.close(1000, "oai-closed"); } catch {}
